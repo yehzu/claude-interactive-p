@@ -1,0 +1,14 @@
+# Per-invocation tmp artifacts (claude-snap uses mktemp -d).
+/tmp/
+
+# macOS / editor cruft.
+.DS_Store
+*.swp
+*~
+
+# Settings backups left by install.sh / uninstall.sh.
+settings.json.bak.*
+
+# Python bytecode from the examples.
+__pycache__/
+*.pyc

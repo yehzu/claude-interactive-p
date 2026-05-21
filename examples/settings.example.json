@@ -1,0 +1,23 @@
+{
+  "_comment": "Example settings.json fragment after running ./install.sh against this repo. install.sh merges these keys into your existing settings.json; this file is for reference only.",
+
+  "statusLine": {
+    "type": "command",
+    "_about": "Points at the snap shim. The shim writes a sidecar file when CLAUDE_SNAP_SIDECAR is set (snap mode) and otherwise execs the command in $CLAUDE_SNAP_REAL_STATUSLINE so your normal TUI output is preserved.",
+    "command": "/absolute/path/to/claude-interactive-p/hooks/statusline.sh"
+  },
+
+  "hooks": {
+    "_about_stop": "Stop fires once per turn after Claude finishes responding. The hook no-ops unless CLAUDE_SNAP_ENVELOPE is set in env, so regular interactive sessions are unaffected. When snap mode IS on, it polls for the post-response statusline tick, writes the final JSON envelope, and SIGTERMs the parent claude process so the TUI exits.",
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/claude-interactive-p/hooks/stop_envelope.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# claude-snap: run interactive Claude under a PTY, auto-submit a prompt, and
+# emit a JSON envelope on stdout when the turn finishes.
+#
+# Envelope shape: superset of `claude -p --output-format=json`, minus ttft_ms
+# (not surfaced by any hook or statusline channel), plus statusline-exclusive
+# fields (rate_limits, context_window, etc).
+#
+# Usage:
+#   claude-snap [claude flags...] "prompt"
+#
+# Reads the same Claude Code config as `claude` itself: default ~/.claude,
+# or override via CLAUDE_CONFIG_DIR. The Stop hook and statusline shim must
+# already be wired into that config (run install.sh once).
+set -euo pipefail
+
+# A snap call only makes sense when there is something for claude to
+# auto-submit. Without a prompt, the TUI launches and sits idle waiting on
+# stdin that never arrives, and the Stop hook never fires. Reject early.
+if [ "$#" -eq 0 ]; then
+  echo "claude-snap: missing prompt" >&2
+  echo "Usage: claude-snap [claude flags...] \"prompt\"" >&2
+  exit 2
+fi
+
+# Info-only flags: hand them straight to claude (no PTY, no envelope). claude
+# prints its own output and exits cleanly, which is what the user asked for.
+# --bare: explicitly incompatible with snap. From claude's own help: "skip
+# hooks, LSP, plugin sync...". No hooks means the Stop hook can't fire, which
+# means snap will hang forever waiting for an envelope that never lands.
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h|--version|-v)
+      exec claude "$@"
+      ;;
+    --bare)
+      echo "claude-snap: --bare disables claude's hook system, which snap" >&2
+      echo "             depends on. Run claude directly instead, or drop --bare." >&2
+      exit 2
+      ;;
+  esac
+done
+
+# If the last arg starts with `-`, it's a flag with no prompt after it, which
+# would launch the TUI with nothing to auto-submit (the `--bare` case). This
+# heuristic doesn't catch a flag-that-takes-a-value as the last arg (e.g.
+# `--model haiku` with no prompt would still hang), but it covers the common
+# slip. A real fix would require knowing claude's full flag spec.
+last_arg="${!#}"
+case "$last_arg" in
+  -*)
+    echo "claude-snap: last argument is a flag ($last_arg), not a prompt" >&2
+    echo "Usage: claude-snap [claude flags...] \"prompt\"" >&2
+    exit 2
+    ;;
+esac
+
+tmp_dir=$(mktemp -d -t claude-snap.XXXXXX)
+cleanup() { rm -rf "$tmp_dir" 2>/dev/null || true; }
+trap cleanup EXIT
+
+export CLAUDE_SNAP_ENVELOPE="$tmp_dir/envelope.json"
+export CLAUDE_SNAP_SIDECAR="$tmp_dir/sidecar.json"
+export CLAUDE_SNAP_DEBUG_LOG="${CLAUDE_SNAP_DEBUG_LOG:-$tmp_dir/debug.log}"
+
+# Wall-clock timer for duration_ms. If python3 isn't available, emit JSON
+# null in the envelope rather than lying with 0.
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || true; }
+start_ms=$(now_ms)
+
+set +e
+script -q /dev/null claude "$@" >/dev/null 2>&1
+rc=$?
+set -e
+
+end_ms=$(now_ms)
+if [ -n "$start_ms" ] && [ -n "$end_ms" ]; then
+  duration_ms=$(( end_ms - start_ms ))
+else
+  duration_ms=null
+fi
+
+if [ ! -f "$CLAUDE_SNAP_ENVELOPE" ]; then
+  {
+    echo "claude-snap: no envelope produced (claude rc=$rc)"
+    [ -f "$CLAUDE_SNAP_DEBUG_LOG" ] && { echo "--- debug log ---"; cat "$CLAUDE_SNAP_DEBUG_LOG"; }
+  } >&2
+  exit 1
+fi
+
+# Enrich from transcript JSONL (flushed by now since claude has exited).
+transcript_path=$(jq -r '.transcript_path // empty' "$CLAUDE_SNAP_ENVELOPE")
+tx_facts='{"num_turns":0,"stop_reason":null,"usage":null,"uuid":null,"modelUsage":{}}'
+
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  tx_facts=$(jq -s '
+    (map(select(.type=="assistant"))) as $asst
+    | ($asst | last // {}) as $last_asst
+    | {
+        num_turns:   ($asst | length),
+        stop_reason: ($last_asst.message.stop_reason // null),
+        usage:       ($last_asst.message.usage // null),
+        uuid:        ($last_asst.uuid // $last_asst.message.id // null),
+        modelUsage: (
+          $asst
+          | map({model: (.message.model // "unknown"), u: (.message.usage // {})})
+          | group_by(.model)
+          | map({
+              key: .[0].model,
+              value: {
+                inputTokens:              (map(.u.input_tokens               // 0) | add),
+                outputTokens:             (map(.u.output_tokens              // 0) | add),
+                cacheReadInputTokens:     (map(.u.cache_read_input_tokens    // 0) | add),
+                cacheCreationInputTokens: (map(.u.cache_creation_input_tokens // 0) | add),
+                webSearchRequests:        (map(.u.server_tool_use.web_search_requests // 0) | add)
+              }
+            })
+          | from_entries
+        )
+      }
+  ' "$transcript_path")
+fi
+
+# Final envelope: -p shape + statusline subtree + new fields.
+jq -n \
+  --argjson draft "$(cat "$CLAUDE_SNAP_ENVELOPE")" \
+  --argjson tx "$tx_facts" \
+  --argjson dur "$duration_ms" '
+  $draft + {
+    is_error:           false,
+    api_error_status:   null,
+    stop_reason:        $tx.stop_reason,
+    num_turns:          $tx.num_turns,
+    duration_ms:        $dur,
+    duration_api_ms:    ($draft.statusline.cost.total_api_duration_ms // null),
+    ttft_ms:            null,
+    total_cost_usd:     ($draft.statusline.cost.total_cost_usd // null),
+    usage:              $tx.usage,
+    modelUsage:         $tx.modelUsage,
+    permission_denials: [],
+    terminal_reason:    "completed",
+    fast_mode_state:    (if ($draft.statusline.fast_mode // false) then "on" else "off" end),
+    uuid:               $tx.uuid
+  }
+'
