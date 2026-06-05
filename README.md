@@ -1,67 +1,205 @@
 # claude-interactive-p
 
-A drop-in replacement for `claude -p --output-format=json` that runs through interactive mode under a PTY, so the JSON envelope includes the statusline-only fields `-p` doesn't expose: `rate_limits.{five_hour, seven_day}` with reset times, `context_window.used_percentage`, `exceeds_200k_tokens`, `fast_mode`, `output_style`, and the rest.
+A drop-in replacement for `claude -p --output-format=json` that runs through interactive mode under a PTY to surface statusline fields `-p` doesn't expose: rate limits, context window usage, fast mode state, and more.
 
-Built for [claude-on-the-fly](https://github.com/CJHwong/claude-on-the-fly), which needs visibility into rate limits and context usage that `-p` doesn't surface.
+Built for [claude-on-the-fly](https://github.com/CJHwong/claude-on-the-fly).
 
-## How it works
+## Tutorial
 
-Three pieces:
-
-- `bin/claude-pty` spawns `claude "prompt"` under a PTY (via `script(1)`), waits for the turn to finish, captures the JSON envelope, and prints it on stdout. It launches claude in the background, polls for the envelope, then terminates claude itself — the wrapper owns the kill (see below).
-- `hooks/statusline.sh` is a transparent shim. When the claude-pty wrapper is active (env var set), it writes the raw statusline payload to a sidecar file. It always delegates the visible TUI rendering to `$CLAUDE_PTY_REAL_STATUSLINE`, so your existing statusline keeps working.
-- `hooks/stop_envelope.sh` fires when the assistant turn finishes. It polls the sidecar for the post-response statusline tick (which lands ~300ms after Stop due to debounce) and writes the merged envelope. That's its only job: the envelope appearing is the "turn done" signal the wrapper polls for.
-
-Without the claude-pty env vars present, both hooks no-op and the statusline shim passes through unchanged, so it's safe to leave installed in your real `~/.claude/settings.json`.
-
-**Who kills claude.** The wrapper terminates claude, not the Stop hook. The hook used to `kill $PPID`, assuming `$PPID` was the claude TUI — but newer Claude Code wraps hook commands in a shell, so `$PPID` became that shell and claude survived, the wrapper blocked forever, and the process tree leaked as orphans. The wrapper knows the real child pid (and, in tmux mode, the session), so it owns the kill.
-
-**tmux mode.** Set `CLAUDE_PTY_TMUX_SESSION=<name>` and, if `tmux` is available, the wrapper hosts claude's PTY in a detached tmux session of that name instead of throwing the rendered TUI at `/dev/null`. You can `tmux attach -t <name>` to watch the live turn. Any tmux failure falls back to the `script` PTY, so it never costs a turn.
-
-## Compatibility
-
-Tested against Claude Code `2.1.146`. The Stop hook relies on `last_assistant_message` in its stdin payload, which is undocumented and could be renamed or removed in future versions. If a Claude Code update breaks the envelope, that field is the first thing to check. The fallback is to read the assistant response from `transcript_path` instead.
-
-## Install
-
-Run the installer straight from GitHub:
+If you just want to try it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
 ```
 
-It fetches the runtime files (`bin/claude-pty`, the two hook scripts, `uninstall.sh`) into `~/.local/share/claude-interactive-p` via curl (no `git clone`), then runs the local install path. Override the destination with `CLAUDE_INTERACTIVE_P_HOME`, the source ref with `CLAUDE_INTERACTIVE_P_REF` (default `main`).
-
-`install.sh` backs up `~/.claude/settings.json`, points `statusLine.command` at the shim, appends the Stop hook (deduped), and prints the `CLAUDE_PTY_REAL_STATUSLINE` export you should add to your shell rc. Set `CLAUDE_PTY_NO_STATUSLINE=1` to skip the statusLine wiring entirely and install only the Stop hook — for callers that don't read the statusline subtree (note: without the shim the startup lock has no release signal, so pair it with `CLAUDE_PTY_NO_LOCK=1`).
-
-Requires `curl` and `jq`. Optionally set `CLAUDE_CONFIG_DIR` before running to install into a non-default config dir. Re-run the curl line to update.
-
-## Use
+Then run a prompt:
 
 ```bash
 ~/.local/share/claude-interactive-p/bin/claude-pty --model haiku "Reply with only the word PONG." | jq
 ```
 
-Output is a single JSON object on stdout. Top-level shape is a superset of `claude -p --output-format=json` (every `-p` key is present), plus `statusline` and a few session fields (`cwd`, `permission_mode`, `transcript_path`, `background_tasks`, `session_crons`).
+The output is a JSON object — a superset of `claude -p --output-format=json` with `statusline` and session fields added.
 
-See `examples/usage.sh` and `examples/usage.py` for integration templates.
-
-## Caveats
-
-- `ttft_ms` is always `null`. Time-to-first-token isn't surfaced by any hook channel; capturing it would require a stream-parsing shim that isn't built.
-- `terminal_reason` is always `"completed"` because the wrapper always terminates claude after Stop. No distinction from error exit.
-- `permission_denials` and `api_error_status` are stubs. Derivable from the transcript but format-fragile; not implemented.
-- `num_turns` counts every `assistant` record (including `ai-title` generation), so it can be higher than `-p`'s.
-- Wall-clock is ~1-2s slower than plain `-p` due to TUI bringup and the post-response statusline poll.
-- **claude-pty serializes only claude's supervisor startup race, not the full turn.** Claude's TUI mode races on a singleton supervisor lock during the first ~1s of boot; two TUIs starting simultaneously leave one (or both) hung. Once a claude is past that window, additional claudes can run in parallel. claude-pty holds a mkdir-based lock at `${CLAUDE_CONFIG_DIR:-~/.claude}/.pty-lock/` to gate that startup window, then hands the lock off as soon as the statusline sidecar appears (signal that claude reached steady state). Parallel callers queue at startup but run concurrently after that. Knobs: `CLAUDE_PTY_LOCK_WAIT_SEC` (acquire timeout, default 600s), `CLAUDE_PTY_LOCK_HOLD_SEC` (hard hold cap if the sidecar never appears, default 10s), `CLAUDE_PTY_NO_LOCK=1` (skip the lock entirely — only safe when the caller already guarantees serial startup). Stale locks (holder PID dead) are stolen automatically.
-
-## Uninstall
+To remove it:
 
 ```bash
 ~/.local/share/claude-interactive-p/uninstall.sh
 ```
 
-Removes the shim from `statusLine.command` and the Stop hook entry. Other hooks and settings keys are left alone. Backup is written first.
+Requires `curl` and `jq`.
+
+## How-to Guides
+
+### Install without the statusline shim
+
+If you only need the Stop hook (you don't consume statusline output in your TUI):
+
+```bash
+CLAUDE_PTY_NO_STATUSLINE=1 curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
+```
+
+This skips wiring `statusLine.command`. At runtime you also need `CLAUDE_PTY_NO_LOCK=1` since the statusline shim is what releases the startup lock — without it the lock never signals and the wrapper hangs on the hard timeout.
+
+### Watch a live turn with tmux
+
+```bash
+CLAUDE_PTY_TMUX_SESSION=watch claude-pty --model sonnet "Explain this codebase."
+```
+
+Then in another terminal:
+
+```bash
+tmux attach -t watch
+```
+
+You see claude's live TUI. Any tmux failure falls back to the `script` PTY so it never costs a turn.
+
+### Drive from Python
+
+```python
+from examples.usage import claude_pty
+
+envelope = claude_pty("Summarize this file.", model="sonnet")
+print(envelope["result"])
+print(envelope["statusline"]["cost"]["total_cost_usd"])
+```
+
+### Drive from shell
+
+```bash
+envelope=$(claude-pty --model haiku "Reply PONG.")
+echo "$envelope" | jq '{result, total_cost_usd, context_pct: .statusline.context_window.used_percentage}'
+```
+
+### Update to latest
+
+Re-run the curl line. It fetches current runtime files and re-wires hooks idempotently:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
+```
+
+### Use a custom config dir
+
+```bash
+CLAUDE_CONFIG_DIR=/tmp/claude-test curl -fsSL https://raw.githubusercontent.com/CJHwong/claude-interactive-p/main/install.sh | bash
+```
+
+### Debug a stuck or failing run
+
+```bash
+CLAUDE_PTY_DEBUG_LOG=/tmp/pty-debug.log claude-pty --model haiku "test"
+cat /tmp/pty-debug.log
+```
+
+## Reference
+
+### CLI
+
+```
+claude-pty [claude flags...] "prompt"
+```
+
+All claude flags (`--model`, `--permission-mode`, etc.) pass through. `--help`, `--version` pass straight to claude. `--bare` is rejected — it disables hooks, which claude-pty depends on.
+
+### Env vars
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Config dir claude reads; hooks must be installed here |
+| `CLAUDE_INTERACTIVE_P_HOME` | `~/.local/share/claude-interactive-p` | Where curl bootstrap drops runtime files |
+| `CLAUDE_INTERACTIVE_P_REPO` | `CJHwong/claude-interactive-p` | GitHub repo for curl bootstrap |
+| `CLAUDE_INTERACTIVE_P_REF` | `main` | Branch/tag for curl bootstrap |
+| `CLAUDE_PTY_NO_STATUSLINE` | unset | Set to `1` to skip statusline wiring at install |
+| `CLAUDE_PTY_YES` | unset | Set to `1` to skip the install confirmation prompt |
+| `CLAUDE_PTY_TMUX_SESSION` | unset | Tmux session name for live-turn watching |
+| `CLAUDE_PTY_NO_LOCK` | unset | Set to `1` to skip startup serialization |
+| `CLAUDE_PTY_LOCK_WAIT_SEC` | `600` | Max seconds to wait for the startup lock |
+| `CLAUDE_PTY_LOCK_HOLD_SEC` | `10` | Max seconds to hold the lock if sidecar never appears |
+| `CLAUDE_PTY_DEBUG_LOG` | unset | File path for debug event log |
+
+### JSON envelope shape
+
+Superset of `claude -p --output-format=json`. Every `-p` key is present, plus:
+
+| Field | Source |
+|---|---|
+| `statusline` | Full statusline payload (cost, context_window, rate_limits, fast_mode, output_style) |
+| `cwd` | Stop hook |
+| `permission_mode` | Stop hook |
+| `transcript_path` | Stop hook |
+| `background_tasks` | Stop hook |
+| `session_crons` | Stop hook |
+| `num_turns` | Parsed from transcript JSONL |
+| `stop_reason` | Parsed from transcript JSONL |
+| `usage` | Parsed from transcript JSONL |
+| `modelUsage` | Aggregated from transcript JSONL, grouped by model |
+| `duration_ms` | Wall-clock measured by the wrapper |
+| `duration_api_ms` | From statusline `cost.total_api_duration_ms` |
+| `fast_mode_state` | `"on"` / `"off"` from statusline |
+
+Stubs (always present, not implemented):
+
+| Field | Value |
+|---|---|
+| `ttft_ms` | `null` |
+| `terminal_reason` | `"completed"` |
+| `permission_denials` | `[]` |
+| `api_error_status` | `null` |
+| `is_error` | `false` |
+
+### Files installed
+
+| Path | Purpose |
+|---|---|
+| `bin/claude-pty` | Wrapper binary |
+| `hooks/statusline.sh` | Statusline shim (sidecar writer + pass-through) |
+| `hooks/stop_envelope.sh` | Stop hook (envelope writer) |
+| `install.sh` | Installer |
+| `uninstall.sh` | Uninstaller |
+
+Settings.json mutations:
+
+- `statusLine.command` → statusline shim (unless `CLAUDE_PTY_NO_STATUSLINE=1`)
+- `.hooks.Stop[]` → Stop hook appended (deduped)
+- Backup written to `settings.json.bak.<timestamp>` before mutation
+- Prior statusline saved to `.pty-prior-statusline` for transparent delegation
+
+## Explanation
+
+### Why not just `claude -p`?
+
+`claude -p --output-format=json` doesn't include rate limit counters, context window usage, fast mode state, or output style. Those fields only flow through the interactive TUI's statusline hook. claude-pty runs the interactive TUI under a PTY so the statusline shim can capture that data and fold it into the output envelope.
+
+### Pipeline
+
+Three pieces run per turn:
+
+1. **`bin/claude-pty`** acquires the startup lock, then launches `claude` under a PTY (either `script` or tmux). It polls for the envelope file and terminates claude when it appears.
+
+2. **`hooks/statusline.sh`** replaces your `statusLine.command`. When `CLAUDE_PTY_SIDECAR` is set, it atomically writes each statusline tick to a sidecar file. It always delegates rendering to your real statusline (resolved from `CLAUDE_PTY_REAL_STATUSLINE`, then `.pty-prior-statusline`, then nothing).
+
+3. **`hooks/stop_envelope.sh`** fires on Stop. It waits for the post-response statusline tick (debounced ~300ms behind Stop), merges Stop stdin + sidecar into a draft envelope, and writes it atomically. The envelope's appearance is the "turn done" signal.
+
+Without the claude-pty env vars, both hooks no-op — safe to leave installed in your real config.
+
+### Who kills claude
+
+The wrapper kills claude, not the Stop hook. The hook used to `kill $PPID`, but newer Claude Code wraps hook commands in a shell — `$PPID` was that shell, claude survived, the wrapper blocked forever, and the process tree leaked. Owning the kill means the wrapper knows the real child pid (and, in tmux mode, the session).
+
+### Startup lock
+
+Claude's TUI mode races on a singleton supervisor lock during the first ~1s of boot. Two TUIs starting simultaneously leave one or both hung. claude-pty serializes only that window with a mkdir-based lock at `$CLAUDE_CONFIG_DIR/.pty-lock/`. Once the statusline sidecar appears (claude reached steady state), the lock is released so the next caller can start. Stale locks from dead holders are stolen automatically.
+
+### Compatibility
+
+Tested against Claude Code `2.1.146`. The Stop hook reads `last_assistant_message` from stdin — undocumented, could be renamed or removed. If it breaks, the fallback is `transcript_path`.
+
+### Caveats
+
+- `ttft_ms` is always `null`. No hook channel surfaces time-to-first-token.
+- `num_turns` counts all `assistant` records including `ai-title` generation, so it can be higher than `-p`'s count.
+- Wall-clock is ~1-2s slower than plain `-p` due to TUI bringup and statusline poll.
 
 ## License
 
