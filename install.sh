@@ -123,8 +123,24 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
   # when CLAUDE_PTY_REAL_STATUSLINE is not exported; uninstall.sh consumes
   # the file to restore the original on the way out.
   PRIOR_STATUSLINE_FILE="$CFG_DIR/.pty-prior-statusline"
+  # Migration: the sidecar was once named .snap-prior-statusline. Seed the new
+  # name from it so an upgrader's saved original isn't orphaned (and lost).
+  if [ ! -f "$PRIOR_STATUSLINE_FILE" ] && [ -f "$CFG_DIR/.snap-prior-statusline" ]; then
+    mv "$CFG_DIR/.snap-prior-statusline" "$PRIOR_STATUSLINE_FILE"
+  fi
   prior_sl=$(jq -r '.statusLine.command // ""' "$SETTINGS")
-  if [ -n "$prior_sl" ] && [ "$prior_sl" != "$SHIM" ]; then
+  if [ -z "$prior_sl" ]; then
+    # No current statusLine — a stale prior would resurrect a command the user
+    # already removed on the next reinstall. Clear it.
+    rm -f "$PRIOR_STATUSLINE_FILE"
+  elif [ "$(basename "$prior_sl")" = "statusline.sh" ]; then
+    # The current statusLine is already a shim (this install's, a sibling
+    # tool's, or a different install path). Saving it as the "prior" would
+    # clobber the user's real original with a shim and chain shims on every
+    # reinstall — the bug the old `!= "$SHIM"` guard missed. Skip; whatever
+    # real original was saved on first install stays put.
+    :
+  else
     printf '%s' "$prior_sl" > "$PRIOR_STATUSLINE_FILE"
     echo "install.sh: saved prior statusLine.command to $PRIOR_STATUSLINE_FILE"
   fi
@@ -134,7 +150,9 @@ if [ "$WIRE_STATUSLINE" = "1" ]; then
       .statusLine = { type: "command", command: $shim }
     | .hooks = (.hooks // {})
     | .hooks.Stop = (
-        ((.hooks.Stop // []) | map(select((.hooks // []) | all(.command != $stop))))
+        ((.hooks.Stop // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $stop))))
+          | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $stop } ] } ]
       )
   ' "$SETTINGS")
@@ -143,7 +161,9 @@ else
     --arg stop "$STOP" '
       .hooks = (.hooks // {})
     | .hooks.Stop = (
-        ((.hooks.Stop // []) | map(select((.hooks // []) | all(.command != $stop))))
+        ((.hooks.Stop // [])
+          | map(.hooks = ((.hooks // []) | map(select(.command != $stop))))
+          | map(select((.hooks // []) | length > 0)))
         + [ { hooks: [ { type: "command", command: $stop } ] } ]
       )
   ' "$SETTINGS")
