@@ -86,6 +86,17 @@ export CLAUDE_PTY_DEBUG_LOG="${CLAUDE_PTY_DEBUG_LOG:-$tmp_dir/debug.log}"
 # found" — survives for the failure dump below instead of vanishing.
 pty_typescript="$tmp_dir/pty_typescript"
 
+# Stall detection: a turn that never starts (login wizard, usage-limit notice,
+# permission dialog) leaves the TUI static and the Stop hook never fires — so
+# polling for the envelope would hang forever. Treat "screen unchanged for
+# CLAUDE_PTY_STALL_SEC seconds with no envelope" as a dead turn: kill claude
+# and emit an error envelope whose result carries the last visible screen
+# lines, so the caller sees WHY (e.g. the rate-limit notice). An active turn
+# repaints continuously (spinner, token counter), so a healthy run never trips
+# this even mid-thought. Set CLAUDE_PTY_STALL_SEC=0 to disable.
+stall_file="$tmp_dir/stalled"
+stall_max="${CLAUDE_PTY_STALL_SEC:-45}"
+
 # Serialize ONLY claude's supervisor startup race. Claude's TUI mode races
 # on a singleton supervisor lock during the first ~1s of boot; two TUIs
 # starting simultaneously leave one (or both) hung. Once a claude is past
@@ -221,9 +232,28 @@ run_claude_pty() {
       tmux kill-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null || true
       if tmux new-session -d -c "$PWD" -s "$CLAUDE_PTY_TMUX_SESSION" "$launch" 2> "$tmp_dir/tmux_err"; then
         pty_log "tmux session live: tmux attach -t $CLAUDE_PTY_TMUX_SESSION"
-        # Wait for the turn (envelope) or claude crashing (session vanishes).
+        # Wait for the turn (envelope), claude crashing (session vanishes), or
+        # a stalled screen (pane content frozen past the stall budget). On
+        # stall, snapshot the pane into $pty_typescript so the failure path
+        # below can surface what claude was showing.
+        local last_sig="" sig="" stall_ticks=0
         while [ ! -f "$CLAUDE_PTY_ENVELOPE" ] && tmux has-session -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null; do
           sleep 0.2
+          if [ "$stall_max" -gt 0 ]; then
+            sig=$(tmux capture-pane -p -t "$CLAUDE_PTY_TMUX_SESSION" 2>/dev/null | cksum 2>/dev/null || true)
+            if [ -n "$sig" ] && [ "$sig" = "$last_sig" ]; then
+              stall_ticks=$((stall_ticks + 1))
+              if [ "$stall_ticks" -ge $((stall_max * 5)) ]; then
+                tmux capture-pane -p -t "$CLAUDE_PTY_TMUX_SESSION" > "$pty_typescript" 2>/dev/null || true
+                : > "$stall_file"
+                pty_log "stall: pane frozen for ${stall_max}s with no envelope; giving up"
+                break
+              fi
+            else
+              stall_ticks=0
+              last_sig="$sig"
+            fi
+          fi
         done
         # Snapshot the pane's last screen before reaping it, so a resume error
         # or crash message claude printed survives in the debug log instead of
@@ -245,10 +275,27 @@ run_claude_pty() {
   # even if claude ignores TERM; killing claude makes `script` exit too.
   # The typescript goes to a file (not /dev/null) so claude's own terminal
   # output is recoverable when no envelope is produced (see the failure dump).
-  script -q "$pty_typescript" claude "$@" > /dev/null 2>&1 &
+  # -t 0 flushes every write, so stall detection (file size+mtime frozen past
+  # the stall budget) tracks the real screen, not the default 30s flush cycle.
+  script -q -t 0 "$pty_typescript" claude "$@" > /dev/null 2>&1 &
   local pty_pid=$!
+  local last_sig="" sig="" stall_ticks=0
   while [ ! -f "$CLAUDE_PTY_ENVELOPE" ] && kill -0 "$pty_pid" 2>/dev/null; do
     sleep 0.2
+    if [ "$stall_max" -gt 0 ]; then
+      sig=$(stat -f '%z %m' "$pty_typescript" 2>/dev/null || stat -c '%s %Y' "$pty_typescript" 2>/dev/null || true)
+      if [ "$sig" = "$last_sig" ]; then
+        stall_ticks=$((stall_ticks + 1))
+        if [ "$stall_ticks" -ge $((stall_max * 5)) ]; then
+          : > "$stall_file"
+          pty_log "stall: no PTY output for ${stall_max}s with no envelope; giving up"
+          break
+        fi
+      else
+        stall_ticks=0
+        last_sig="$sig"
+      fi
+    fi
   done
   local kid
   for kid in $(pgrep -P "$pty_pid" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null || true; done
@@ -284,28 +331,58 @@ else
 fi
 
 if [ ! -f "$CLAUDE_PTY_ENVELOPE" ]; then
+  terminal_reason="no_envelope"
+  [ -f "$stall_file" ] && terminal_reason="stalled"
+  # claude's own terminal output usually names the cause (a usage-limit notice,
+  # a login wizard, "No conversation found" on a bad resume). Strip ANSI/CR so
+  # it's readable rather than buried in TUI escapes. Captured in script-PTY
+  # mode always, and in tmux mode when the stall watcher snapshotted the pane.
+  #
+  # Strip CSI (incl. private <>=? params), OSC (BEL- *and* ST/ESC-\\-
+  # terminated), and charset-select escapes, then drop any remaining control
+  # bytes (keep tab/newline) so leftover escape fragments and echoed ^D
+  # don't clutter the message. Trailing `|| true` is load-bearing: under the
+  # active `set -e`/`pipefail`, a stage exiting non-zero (e.g. grep matching
+  # nothing, or a SIGPIPE) would otherwise abort the run before the failure
+  # is reported — the opposite of diagnosing it.
+  screen_tail=""
+  if [ -s "$pty_typescript" ]; then
+    screen_tail=$(tail -c 4000 "$pty_typescript" \
+      | LC_ALL=C sed $'s/\x1b\\[[0-9;?<>=]*[a-zA-Z]//g; s/\x1b\\][^\x1b\x07]*\x1b\\\\//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][0-9A-Za-z]//g' \
+      | LC_ALL=C tr -d '\000-\010\013-\037' \
+      | grep -v '^[[:space:]]*$' | tail -20 || true)
+  fi
   {
-    echo "claude-pty: no envelope produced (claude rc=$rc)"
-    # claude's own terminal output usually names the cause (e.g. a resume of a
-    # missing/empty session prints "No conversation found"). Strip ANSI/CR so
-    # it's readable rather than buried in TUI escapes. Script-PTY mode only;
-    # tmux mode leaves its final pane in the debug log instead.
-    if [ -s "$pty_typescript" ]; then
-      echo "--- claude output (tail) ---"
-      # Strip CSI (incl. private <>=? params), OSC (BEL- *and* ST/ESC-\\-
-      # terminated), and charset-select escapes, then drop any remaining control
-      # bytes (keep tab/newline) so leftover escape fragments and echoed ^D
-      # don't clutter the message. Trailing `|| true` is load-bearing: under the
-      # active `set -e`/`pipefail`, a stage exiting non-zero (e.g. grep matching
-      # nothing, or a SIGPIPE) would otherwise abort this block and skip the
-      # debug-log dump below — the opposite of diagnosing the failure.
-      tail -c 4000 "$pty_typescript" \
-        | LC_ALL=C sed $'s/\x1b\\[[0-9;?<>=]*[a-zA-Z]//g; s/\x1b\\][^\x1b\x07]*\x1b\\\\//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][0-9A-Za-z]//g' \
-        | LC_ALL=C tr -d '\000-\010\013-\037' \
-        | grep -v '^[[:space:]]*$' | tail -20 || true
-    fi
+    echo "claude-pty: no envelope produced (claude rc=$rc, reason=$terminal_reason)"
+    [ -n "$screen_tail" ] && { echo "--- claude output (tail) ---"; printf '%s\n' "$screen_tail"; }
     [ -f "$CLAUDE_PTY_DEBUG_LOG" ] && { echo "--- debug log ---"; cat "$CLAUDE_PTY_DEBUG_LOG"; }
   } >&2
+  # Machine-parseable failure on stdout, mirroring the `claude -p
+  # --output-format=json` error shape, so callers that parse the envelope get
+  # the reason (e.g. the rate-limit notice in .result) instead of empty stdout.
+  jq -n \
+    --arg result "${screen_tail:-claude produced no output before the turn was abandoned}" \
+    --arg reason "$terminal_reason" \
+    --argjson dur "$duration_ms" '
+    {
+      type:               "result",
+      subtype:            "error_during_execution",
+      is_error:           true,
+      api_error_status:   null,
+      result:             $result,
+      terminal_reason:    $reason,
+      stop_reason:        null,
+      num_turns:          0,
+      duration_ms:        $dur,
+      duration_api_ms:    null,
+      ttft_ms:            null,
+      total_cost_usd:     null,
+      usage:              null,
+      modelUsage:         {},
+      permission_denials: [],
+      uuid:               null
+    }
+  '
   exit 1
 fi
 

@@ -116,6 +116,7 @@ All claude flags (`--model`, `--permission-mode`, etc.) pass through. `--help`, 
 | `CLAUDE_PTY_NO_LOCK` | unset | Set to `1` to skip startup serialization |
 | `CLAUDE_PTY_LOCK_WAIT_SEC` | `600` | Max seconds to wait for the startup lock |
 | `CLAUDE_PTY_LOCK_HOLD_SEC` | `10` | Max seconds to hold the lock if sidecar never appears |
+| `CLAUDE_PTY_STALL_SEC` | `45` | Seconds the screen may stay frozen with no envelope before the turn is declared stalled and killed (`0` disables) |
 | `CLAUDE_PTY_DEBUG_LOG` | unset | File path for debug event log |
 
 ### JSON envelope shape
@@ -143,10 +144,26 @@ Stubs (always present, not implemented):
 | Field | Value |
 |---|---|
 | `ttft_ms` | `null` |
-| `terminal_reason` | `"completed"` |
 | `permission_denials` | `[]` |
 | `api_error_status` | `null` |
-| `is_error` | `false` |
+
+### Failure envelope
+
+A turn that never completes still produces a JSON envelope on stdout (exit
+code 1). This happens when the TUI gets stuck on a screen that can't proceed
+headlessly — a usage-limit notice, a login wizard, a permission dialog — or
+when claude dies before the Stop hook fires. The stall watcher kills claude
+once the screen has been frozen for `CLAUDE_PTY_STALL_SEC` seconds with no
+envelope, then emits:
+
+| Field | Value |
+|---|---|
+| `is_error` | `true` |
+| `terminal_reason` | `"stalled"` (frozen screen) or `"no_envelope"` (claude died) |
+| `result` | Last visible screen lines, ANSI-stripped — e.g. the rate-limit message |
+| `subtype` | `"error_during_execution"` |
+
+On success `terminal_reason` is `"completed"` and `is_error` is `false`.
 
 ### Files installed
 
